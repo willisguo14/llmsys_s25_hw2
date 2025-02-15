@@ -155,8 +155,75 @@ __global__ void MatrixMultiplyKernel(
     const int* b_shape,
     const int* b_strides
 ) {
+  /**
+   * Multiply two (compact) matrices into an output (also comapct) matrix. Matrix a and b are both in a batch
+   * format, with shape [batch_size, m, n], [batch_size, n, p].
+   * Requirements:
+   * - All data must be first moved to shared memory.
+   * - Only read each cell in a and b once.
+   * - Only write to global memory once per kernel.
+   * There is guarantee that a_shape[0] == b_shape[0], a_shape[2] == b_shape[1],
+   * and out_shape[0] == a_shape[0], out_shape[1] == b_shape[1]
+   *
+   * Args:
+   *   out: compact 1D array of size batch_size x m x p to write the output to
+   *   out_shape: shape of the output array
+   *   out_strides: strides of the output array
+   *   a_storage: compact 1D array of size batch_size x m x n
+   *   a_shape: shape of the a array
+   *   a_strides: strides of the a array
+   *   b_storage: comapct 2D array of size batch_size x n x p
+   *   b_shape: shape of the b array
+   *   b_strides: strides of the b array
+   *
+   * Returns:
+   *   None (Fills in out array)
+   */
 
-    assert(false && "Not Implemented");
+    __shared__ float a_shared[TILE][TILE];
+    __shared__ float b_shared[TILE][TILE];
+
+    int batch = blockIdx.z;
+
+    int bx = blockIdx.x; int by = blockIdx.y;
+    int tx = threadIdx.x; int ty = threadIdx.y;
+
+    int a_batch_stride = a_shape[0] > 1 ? a_strides[0] : 0;
+    int b_batch_stride = b_shape[0] > 1 ? b_strides[0] : 0;
+    int out_batch_stride = out_shape[0] > 1 ? out_strides[0] : 0;
+
+    int m = out_shape[1];
+    int n = a_shape[2];
+    int p = out_shape[2];
+
+    int row = by * TILE + ty;
+    int col = bx * TILE + tx;
+
+    float value = 0.0f;
+
+    for (int tileIdx = 0; tileIdx < (n + TILE - 1) / TILE; ++tileIdx) {
+        if (row < m && tileIdx * TILE + tx < n) {
+            a_shared[ty][tx] = a_storage[batch * a_batch_stride + row * a_strides[1] + (tileIdx * TILE + tx) * a_strides[2]];
+        } else {
+            a_shared[ty][tx] = 0.0f;
+        }
+        if (tileIdx * TILE + ty < n && col < p) {
+            b_shared[ty][tx] = b_storage[batch * b_batch_stride + (tileIdx * TILE + ty) * b_strides[1] + col * b_strides[2]];
+        } else {
+            b_shared[ty][tx] = 0.0f;
+        }
+        __syncthreads(); 
+
+        for (int k = 0; k < TILE; ++k) {
+            value += a_shared[ty][k] * b_shared[k][tx];
+        }
+        __syncthreads(); 
+    }
+
+    if (row < m && col < p) {
+        out[batch * out_batch_stride + row * out_strides[1] + col * out_strides[2]] = value;
+    }
+
 }
 
 
@@ -171,7 +238,45 @@ __global__ void mapKernel(
     int shape_size,
     int fn_id
 ) {
-    assert(false && "Not Implemented");
+    /**
+   * Map function. Apply a unary function to each element of the input array and store the result in the output array.
+   * Optimization: Parallelize over the elements of the output array.
+   *
+   * You may find the following functions useful:
+   * - index_to_position: converts an index to a position in a compact array
+   * - to_index: converts a position to an index in a multidimensional array
+   * - broadcast_index: converts an index in a smaller array to an index in a larger array
+   *
+   * Args:
+   *  out: compact 1D array of size out_size to write the output to
+   *  out_shape: shape of the output array
+   *  out_strides: strides of the output array
+   *  out_size: size of the output array
+   *  in_storage: compact 1D array of size in_size
+   *  in_shape: shape of the input array
+   *  in_strides: strides of the input array
+   *  shape_size: number of dimensions in the input and output arrays, assume dimensions are the same
+   *  fn_id: id of the function to apply to each element of the input array
+   *
+   * Returns:
+   *  None (Fills in out array)
+   */
+  
+    int out_index[MAX_DIMS];
+    int in_index[MAX_DIMS];
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid > out_size) return;
+
+    to_index(tid, out_shape, out_index, shape_size);
+
+    int out_pos = index_to_position(out_index, out_strides, shape_size);
+
+    broadcast_index(out_index, out_shape, in_shape, in_index, shape_size, shape_size);
+    int in_pos = index_to_position(in_index, in_strides, shape_size);
+
+    out[out_pos] = fn(fn_id, in_storage[in_pos]);
 }
 
 
@@ -188,7 +293,60 @@ __global__ void reduceKernel(
     int shape_size,
     int fn_id
 ) {
-    assert(false && "Not Implemented");
+    /**
+   * Reduce function. Apply a reduce function to elements of the input array a and store the result in the output array.
+   * Optimization:
+   * Parallelize over the reduction operation. Each kernel performs one reduction.
+   * e.g. a = [[1, 2, 3], [4, 5, 6]], kernel0 computes reduce([1, 2, 3]), kernel1 computes reduce([4, 5, 6]).
+   *
+   * You may find the following functions useful:
+   * - index_to_position: converts an index to a position in a compact array
+   * - to_index: converts a position to an index in a multidimensional array
+   *
+   * Args:
+   *  out: compact 1D array of size out_size to write the output to
+   *  out_shape: shape of the output array
+   *  out_strides: strides of the output array
+   *  out_size: size of the output array
+   *  a_storage: compact 1D array of size in_size
+   *  a_shape: shape of the input array
+   *  a_strides: strides of the input array
+   *  reduce_dim: dimension to reduce on
+   *  reduce_value: initial value for the reduction
+   *  shape_size: number of dimensions in the input & output array, assert dimensions are the same
+   *  fn_id: id of the reduce function, currently only support add, multiply, and max
+   *
+   *
+   * Returns:
+   *  None (Fills in out array)
+   */
+
+    // __shared__ double cache[BLOCK_DIM]; // Uncomment this line if you want to use shared memory to store partial results
+    int out_index[MAX_DIMS];
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid > out_size) return;
+
+    to_index(tid, out_shape, out_index, shape_size);
+
+    int* a_index = out_index;
+
+    int out_pos = index_to_position(out_index, out_strides, shape_size);
+
+    out[out_pos] = reduce_value;
+
+    int reduce_size = a_shape[reduce_dim];
+
+    for (int s = 0; s < reduce_size; ++s) {
+        a_index[reduce_dim] = s;
+        int a_pos = index_to_position(a_index, a_strides, shape_size);
+        
+        // out_index[reduce_dim] = s;
+        // a_pos = index_to_position(out_index, a_strides, shape_size);
+        
+        out[out_pos] = fn(fn_id, out[out_pos], a_storage[a_pos]);
+    } 
 }
 
 __global__ void zipKernel(
@@ -207,7 +365,56 @@ __global__ void zipKernel(
     int b_shape_size,
     int fn_id
 ) {
-    assert(false && "Not Implemented");
+    /**
+   * Zip function. Apply a binary function to elements of the input array a & b and store the result in the output array.
+   * Optimization: Parallelize over the elements of the output array.
+   *
+   * You may find the following functions useful:
+   * - index_to_position: converts an index to a position in a compact array
+   * - to_index: converts a position to an index in a multidimensional array
+   * - broadcast_index: converts an index in a smaller array to an index in a larger array
+   *
+   * Args:
+   *  out: compact 1D array of size out_size to write the output to
+   *  out_shape: shape of the output array
+   *  out_strides: strides of the output array
+   *  out_size: size of the output array
+   *  out_shape_size: number of dimensions in the output array
+   *  a_storage: compact 1D array of size in_size
+   *  a_shape: shape of the input array
+   *  a_strides: strides of the input array
+   *  a_shape_size: number of dimensions in the input array
+   *  b_storage: compact 1D array of size in_size
+   *  b_shape: shape of the input array
+   *  b_strides: strides of the input array
+   *  b_shape_size: number of dimensions in the input array
+   *  fn_id: id of the function to apply to each element of the a & b array
+   *
+   *
+   * Returns:
+   *  None (Fills in out array)
+   */
+
+    int out_index[MAX_DIMS];
+    int a_index[MAX_DIMS];
+    int b_index[MAX_DIMS];
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid > out_size) return;
+
+
+    to_index(tid, out_shape, out_index, out_shape_size);
+
+    int out_pos = index_to_position(out_index, out_strides, out_shape_size); // FIXME: necessary?
+
+    broadcast_index(out_index, out_shape, a_shape, a_index, out_shape_size, a_shape_size);
+    broadcast_index(out_index, out_shape, b_shape, b_index, out_shape_size, b_shape_size);
+
+    int a_pos = index_to_position(a_index, a_strides, a_shape_size);
+    int b_pos = index_to_position(b_index, b_strides, b_shape_size);
+
+    out[out_pos] = fn(fn_id, a_storage[a_pos], b_storage[b_pos]);
 }
 
 
@@ -254,7 +461,7 @@ void MatrixMultiply(
 
     int threadsPerBlock = BASE_THREAD_NUM;
     dim3 blockDims(threadsPerBlock, threadsPerBlock, 1); // Adjust these values based on your specific requirements
-    dim3 gridDims((m + threadsPerBlock - 1) / threadsPerBlock, (p + threadsPerBlock - 1) / threadsPerBlock, batch);
+    dim3 gridDims((p + threadsPerBlock - 1) / threadsPerBlock, (m + threadsPerBlock - 1) / threadsPerBlock, batch);
     MatrixMultiplyKernel<<<gridDims, blockDims>>>(
         d_out, d_out_shape, d_out_strides, d_a, d_a_shape, d_a_strides, d_b, d_b_shape, d_b_strides
     );
