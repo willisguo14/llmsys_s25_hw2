@@ -141,7 +141,7 @@ def backpropagate(variable: Variable, deriv: Any) -> None:
         else:
             for in_var, local_deriv in var.chain_rule(var_to_deriv[var.unique_id]):
                 if not in_var.is_constant():
-                    var_to_deriv[in_var.unique_id] = var_to_deriv.get(in_var.unique_id, 0) + local_deriv
+                    var_to_deriv[in_var.unique_id] = var_to_deriv.get(in_var.unique_id, 0.0) + local_deriv
     # END ASSIGN1_1
 
 
